@@ -1,0 +1,158 @@
+---
+- hosts: local
+  connection: local
+  gather_facts: False
+  vars:
+    instance_type: t2.micro
+    security_group: 
+    image: ami-03fac5402e10ea93b 
+    keypair: <your keypair here>
+    region: us-west-1
+    count: 
+  vars_files:
+    - aws_keys.yml
+  tasks:
+    - name: Create a security group
+      ec2_group:
+        name: 
+        description: The webservers security group
+        region: us-west-1
+        aws_access_key: <aws_access_key>
+        aws_secret_key: <aws_secret_key>
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+
+    - name: Launch the new EC2 Instance
+      ec2:
+        aws_access_key: <aws_access_key>
+        aws_secret_key: <aws_secret_key>
+        group: 
+        instance_type: t2.micro
+        image: ami-03fac5402e10ea93b 
+        wait: true
+        region: us-west-1
+        keypair: <your keypair here>
+        count: 1
+      register: ec2
+
+    - name: Add the newly created host so that we can further contact it
+      add_host:
+        name: "{{ item.public_ip }}"
+        groups: webservers
+      with_items: "{{ ec2.instances }}"
+
+    - name: Add tag to Instance(s)
+      ec2_tag:
+        aws_access_key: <aws_access_key>
+        aws_secret_key: <aws_secret_key>
+        resource: "{{ item.id }}"
+        region: us-west-1
+        state: "present"
+      with_items: "{{ ec2.instances }}"
+      args:
+        tags:
+          Type: webserver
+
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ item.public_ip }}"
+        port: 22
+        state: started
+      with_items: "{{ ec2.instances }}"
+- hosts: webservers
+  remote_user: ubuntu
+  become: yes
+  gather_facts: no
+  pre_tasks:
+   - name: 'install python'
+     raw: 'sudo apt-get -y install python'
+  tasks:
+   - name: Install Apache
+     apt:
+       name: apache2
+       state: present
+   - service:
+       name: apache2
+       state: started
+       enabled: yes
+
+   - name: "UFW - Allow HTTP on port 80"
+     ufw:
+       rule: allow
+       port: 80
+       proto: tcp
+
+# SeedDMS Configuration #
+   - name: Create Directory
+     file:
+       path: /etc/httpd/conf.d
+       state: directory
+
+   - name: Ensure pecl is installed (if configured).
+     package:
+       name: php-pear
+       state: present
+
+   - name: Download SeedDMS Components
+     get_url: url={{ item }} dest=/var/www/html
+     with_items:
+      - "http://downloads.sourceforge.net/project/seeddms/seeddms-5.0.4/SeedDMS_Core-5.0.4.tgz?r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Fseeddms%2Ffiles%2Fseeddms-5.0.4%2F&ts=1470249526&use_mirror=heanet"
+      - "http://downloads.sourceforge.net/project/seeddms/seeddms-5.0.4/SeedDMS_Preview-1.1.9.tgz?r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Fseeddms%2Ffiles%2Fseeddms-5.0.4%2F&ts=1470251243&use_mirror=pilotfiber"
+      - "http://downloads.sourceforge.net/project/seeddms/seeddms-5.0.4/SeedDMS_Lucene-1.1.9.tgz?r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Fseeddms%2Ffiles%2Fseeddms-5.0.4%2F&ts=1470236169&use_mirror=heanet"
+ 
+   - name: Pear install the downloaded files
+     command: pear install {{ item }}
+     with_items:
+      - /var/www/html/SeedDMS_Core-5.0.4.tgz
+      - /var/www/html/SeedDMS_Lucene-1.1.9.tgz
+      - /var/www/html/SeedDMS_Preview-1.1.9.tgz
+
+   - name: Prep WebDVA download 
+     command: pear config-set preferred_state beta
+
+   - name: Download WebDVA  
+     pear: name=HTTP_WebDAV_Server state=present
+
+   - name: Download and extract SeedDMS file
+     unarchive: src="http://downloads.sourceforge.net/project/seeddms/seeddms-5.0.4/seeddms-5.0.4.tar.gz?r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Fseeddms%2Ffiles%2Fseeddms-5.0.4%2F&ts=1470236050&use_mirror=pilotfiber" dest=/var/www/html copy=no
+
+   - name: Move and rename extracted file
+     command: mv /var/www/html/seeddms-5.0.4 /var/www/html/seeddms
+
+   - name: Create necessary data files
+     file: path=/var/www/html/seeddms/{{ item }} state=directory mode=0775
+     with_items:
+       - data
+       - "data/cache"
+       - "data/lucene"
+       - "data/staging"
+
+   - name: Create install tool
+     file: path=/var/www/html/seeddms/conf/ENABLE_INSTALL_TOOL state=touch mode=0775
+
+   - name: Pass ownership of seeddms files to apache
+     file: path=/var/www/html state=directory owner=ubuntu mode=0775 recurse=yes
+
+   - name: Make SeedDMS.conf file
+     file: path=/etc/httpd/conf.d/seeddms.conf state=touch mode=0775
+
+   - name: Make SeedDMS the default webpage displayed
+     blockinfile:
+       dest: /etc/httpd/conf.d/seeddms.conf
+       block: |
+         RewriteEngine on
+         RedirectMatch ^/$ /seeddms/
